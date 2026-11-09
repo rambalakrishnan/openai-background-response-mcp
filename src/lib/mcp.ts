@@ -32,7 +32,7 @@ const SUBMISSION_STATUSES = [
   "incomplete",
 ] as const;
 
-const SERVICE_TIERS = ["flex"] as const;
+const SERVICE_TIERS = ["auto", "default", "flex"] as const;
 
 const responseIdField = z.string().min(1, "response_id must be a non-empty string");
 

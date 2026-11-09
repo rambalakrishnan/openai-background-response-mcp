@@ -54,8 +54,8 @@ export type InFlightSubmissionStatus = "submitted" | "queued" | "in_progress";
 /** Where the latest stored response bytes were observed. */
 export type ResponseSource = "submit" | "poll" | "webhook";
 
-/** Service tier for generation requests (always `"flex"` in background mode). */
-export type ServiceTier = "flex";
+/** Service tier for generation requests (default `"flex"`, client-overridable). */
+export type ServiceTier = "auto" | "default" | "flex";
 
 /** OpenAI webhook event types the ledger accepts; anything else is rejected. */
 export type OpenAIWebhookEventType =
