@@ -65,7 +65,7 @@ describe("scaffold gate: OMP legacy handshake", () => {
     const listBody = await readRpc<{
       result?: { tools?: Array<{ name?: string }> };
     }>(listRes);
-    expect(listBody.result?.tools?.map((t) => t.name)).toContain("ping");
+    expect(listBody.result?.tools?.map((t) => t.name)).toContain("flex_list");
   });
 
   it("rejects GET with 405 so OMP's background listener disables itself", async () => {
@@ -76,7 +76,7 @@ describe("scaffold gate: OMP legacy handshake", () => {
     expect(res.status).toBe(405);
   });
 
-  it("calls the ping tool", async () => {
+  it("rejects an unknown tool without collapsing to a 500", async () => {
     const res = await postRpc({
       jsonrpc: "2.0",
       id: 3,
@@ -85,8 +85,8 @@ describe("scaffold gate: OMP legacy handshake", () => {
     });
     expect(res.status).toBe(200);
     const body = await readRpc<{
-      result?: { content?: Array<{ type?: string; text?: string }> };
+      error?: { message?: string };
     }>(res);
-    expect(body.result?.content?.[0]?.text).toBe("pong");
+    expect(body.error).toBeDefined();
   });
 });
