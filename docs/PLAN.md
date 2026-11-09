@@ -45,7 +45,7 @@ LSP; commit separately.
 
 | Agent | Reads | Writes |
 |-------|-------|--------|
-| McpSurface | `agents/mcp/server` docs, ARCHITECTURE §5, TESTING §11 | `src/lib/mcp.ts` (factory + 8 zod schemas), `src/handlers/tools.ts` (implementations; pure builder + extractor for TESTING §1/§4) |
+| McpSurface | bare `@modelcontextprotocol/server` v2 docs (see TRANSPORT_DECISION.md), ARCHITECTURE §5, TESTING §11 | `src/lib/mcp.ts` (factory + 8 zod schemas), `src/handlers/tools.ts` (implementations; pure builder + extractor for TESTING §1/§4) |
 | Webhook | `handlers/webhook.ts`, REUSE.md row 9, TESTING §9 | `src/handlers/webhook.ts` (rewired), `src/index.ts` (host dispatch per TESTING §12) |
 
 Owner: protocol + routing tests (§11–12), full suite, manual

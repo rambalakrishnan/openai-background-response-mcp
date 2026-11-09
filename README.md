@@ -13,7 +13,15 @@ hands for `service_tier: "flex"` background Responses:
 
 ## Status
 
-Requirements gathering. See `docs/REQUIREMENTS.md` (once drafted).
+v1 built, 61 tests green. Eight tools (`flex_submit`, `flex_status`,
+`flex_children`, `flex_get`, `flex_list`, `flex_cancel`, `flex_delete`,
+`flex_usage`) over a singleton-ledger DO with webhook completion. See
+`docs/REQUIREMENTS.md`, `docs/ARCHITECTURE.md`, `docs/TESTING.md`.
+
+Deploy: set the four required secrets (`OPENAI_API_KEY`,
+`OPENAI_WEBHOOK_SECRET`, `MCP_HOST`, `HOOKS_HOST`) via
+`wrangler secret put`, attach the two hostnames in the Cloudflare
+Dashboard (Access on the MCP host), then `wrangler deploy`.
 
 ## Public-repo hygiene
 
