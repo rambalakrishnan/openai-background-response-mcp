@@ -29,12 +29,12 @@ hand-rolled dispatcher.
   handshake, GET streams, `Last-Event-ID` resumption) is far larger
   than modern-only DIY was.
 
-## Scaffold gate (must pass before product code)
+## Scaffold gate — PASSED 2026-11-09
 
-POST OMP's actual `initialize` (protocol `2025-11-25`) at the bare
-handler in miniflare and confirm a working handshake +
-`notifications/initialized` + `tools/list`. If it fails, fall back to
-Agents SDK before writing product code.
+`test/gate.test.ts` (kept as a permanent protocol smoke test):
+OMP's `initialize` at `2025-11-25` → `notifications/initialized` →
+`tools/list` → `tools/call` all pass against bare SDK 2.4.0 in
+miniflare; GET returns 405. No `nodejs_compat` flag required.
 
 ## References
 
