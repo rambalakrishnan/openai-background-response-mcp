@@ -437,7 +437,7 @@ export async function withScopedAbort<T>(
 ): Promise<T> {
   const controller = new AbortController();
   let completed = false;
-  let timerId: number | null = null;
+  let timerId: ReturnType<typeof setTimeout> | null = null;
 
   const cleanupCallbacks: Array<() => void> = [];
 
@@ -487,7 +487,9 @@ export async function withScopedAbort<T>(
     return await fn(controller.signal);
   } finally {
     completed = true;
-    clearTimeout(timerId);
+    if (timerId !== null) {
+      clearTimeout(timerId);
+    }
     for (const cleanup of cleanupCallbacks) {
       cleanup();
     }
