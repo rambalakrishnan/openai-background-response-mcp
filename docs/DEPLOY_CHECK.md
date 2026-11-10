@@ -14,11 +14,13 @@ Both custom domains resolved immediately (no propagation wait needed).
 | 6 | `POST /mcp` tools/list | 8 flex_* tools | 8 tools served |
 | 7 | `POST /mcp` tools/call flex_list | empty page JSON | `{"items":[],"next_cursor":null}` |
 
-## Action required: Access not yet applied
+## Follow-up: Access applied + wet-run verified
 
-Probe 3 returned 200, so Cloudflare Access is NOT yet protecting
-`flex-mcp.5900209.xyz` — the MCP endpoint is publicly reachable right
-now. Apply the self-hosted Access app + Allow policy (and service
-token) per the deployment runbook before treating this as done.
-The webhook host correctly requires no Access (signature auth
-verified by probe 4's 401).
+The probe-3 gap is closed: Cloudflare Access now protects the MCP host
+(self-hosted app + account-members Allow + service-token Service Auth
+policy; unauthenticated probes 302 to `cloudflareaccess.com`), and the
+webhook host remains correctly public. A full wet-run battery against
+live OpenAI then verified submit → webhook completion with authoritative
+retrieval → get → lineage → cancel/delete/usage, including external
+`previous_response_id` chaining (see `docs/CLIENT_GUIDE.md` for the
+standing client contract this verified).
