@@ -61,7 +61,7 @@ POST /openai (Host: HOOKS_HOST, public)
  -> handlers/webhook.ts: verify signature BEFORE ack (401/403 on failure)
  -> LedgerDO.enqueueWebhook: idempotent inbox insert (webhook_id dedupe)
  -> 200 ack immediately after durable enqueue
- -> LedgerDO alarm: deliver inbox rows to submissions (backoff on SQLite-full only)
+ -> LedgerDO alarm: claim row, fetch authoritative GET (outside txn), apply full envelope (backoff on SQLite-full or retrieval failure)
 ```
 
 Same trap discipline as the orchestrator: verify-before-ack,
@@ -152,15 +152,17 @@ src/
     tools.ts        MCP tool implementations (Worker-side OpenAI I/O)
     webhook.ts      verify-then-enqueue ingress (copied, rewired)
   do/
-    ledger-do.ts    LedgerDO: RPC, alarm redelivery, no OpenAI calls
+    ledger-do.ts    LedgerDO: RPC, alarm redelivery with authoritative GET (outside txn)
 ```
 
 ## §7 — Invariants
 
 1. Sync Responses are refused: `background` is forced true; any
    client attempt to unset it is a validation error.
-2. The ledger never performs network I/O. All OpenAI calls happen in
-   the Worker; the DO stores bytes it is handed.
+2. The ledger performs network I/O in exactly one place: alarm-time
+   authoritative retrieval (`GET /responses/{id}`) after a status-only
+   webhook event, always OUTSIDE `transactionSync` (claim → fetch →
+   apply). All other OpenAI calls happen in the Worker.
 3. No I/O or `await` inside `transactionSync`. Ever.
 4. Exact bytes stored: request bodies and observed responses are
    persisted verbatim (minus credentials). Nothing is re-serialized,

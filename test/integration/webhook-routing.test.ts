@@ -67,6 +67,59 @@ async function driveAlarm(stub: DurableObjectStub<LedgerDO>): Promise<void> {
   });
 }
 
+/**
+ * Drives the alarm with `globalThis.fetch` stubbed INSIDE the DO isolate so
+ * authoritative retrieval answers with the given response id's completed
+ * envelope. Pass-through for non-OpenAI fetches.
+ */
+async function driveAlarmWithRetrieval(
+  stub: DurableObjectStub<LedgerDO>,
+  responseId: string,
+): Promise<void> {
+  await runInDurableObject(stub, async (instance: LedgerDO) => {
+    const savedFetch = globalThis.fetch;
+    const stubFetch: typeof fetch = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (
+        (init?.method ?? "GET").toUpperCase() === "GET" &&
+        url.endsWith(`/responses/${responseId}`)
+      ) {
+        return new Response(
+          JSON.stringify({
+            id: responseId,
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                status: "completed",
+                role: "assistant",
+                content: [{ type: "output_text", text: "retrieved-output" }],
+              },
+            ],
+            usage: {
+              input_tokens: 5,
+              input_tokens_details: { cached_tokens: 0 },
+              output_tokens: 3,
+              output_tokens_details: { reasoning_tokens: 0 },
+              total_tokens: 8,
+            },
+            error: null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return savedFetch(input, init);
+    };
+    globalThis.fetch = stubFetch;
+    try {
+      await instance.alarm();
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+}
+
 function completedBody(responseId: string, eventId: string): string {
   return JSON.stringify({
     id: eventId,
@@ -130,11 +183,12 @@ describe("webhook signature through HTTP (§3, §9)", () => {
     expect(redelivery.res.status).toBe(200);
     expect((await readReceipt(redelivery.res)).kind).toBe("duplicate");
 
-    await driveAlarm(stub);
+    await driveAlarmWithRetrieval(stub, responseId);
 
     const record = await stub.getSubmission(responseId);
     expect(record?.status).toBe("completed");
     expect(record?.response_source).toBe("webhook");
+    expect(record?.usage).toMatchObject({ totalTokens: 8 });
   });
 
   it("rejects a wrong-secret delivery and stores nothing", async () => {

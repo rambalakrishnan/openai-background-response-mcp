@@ -7,10 +7,13 @@
  * schedules alarms from persisted deadlines, and delivers due inbox rows.
  *
  * Invariants (docs/ARCHITECTURE.md §7):
- * 1. The ledger never performs network I/O. No OpenAI calls, no `fetch` — the Worker
- *    hands exact bytes to these RPC methods and this class only stores them.
+ * 1. The ledger performs network I/O in exactly one place: alarm-time
+ *    authoritative retrieval (`GET /responses/{id}`) after a status-only
+ *    webhook event, always OUTSIDE `transactionSync`. All other OpenAI calls
+ *    happen in the Worker, which hands exact bytes to these RPC methods.
  * 2. No I/O and no `await` inside `transactionSync`. Ever. Dates are computed before
- *    transactions; alarm delivery is synchronous SQLite work per row.
+ *    transactions; alarm delivery claims a row synchronously, fetches outside
+ *    the transaction, then applies the observation in a second transaction.
  * 3. Exact bytes stored: request/response blobs persist verbatim (minus credentials,
  *    which never reach this class). Nothing is re-serialized or truncated.
  * 4. 1.5 MB artifact/row guards enforced on every write by `src/db/ledger.ts`.
@@ -49,6 +52,9 @@ import {
   usageSourceRows as dbUsageSourceRows,
 } from "../db/ledger.ts";
 import { now } from "../lib/clock.ts";
+import { HttpError } from "../http.ts";
+import { resolveEnvSecret, retrieveProviderResponse } from "../lib/openai.ts";
+import type { ProviderResponseRetrieval } from "../lib/openai.ts";
 import type {
   CancelOutcome,
   DeleteOutcome,
@@ -101,6 +107,15 @@ const WEBHOOK_EVENT_STATUS: Record<OpenAIWebhookEventType, SubmissionStatus> = {
   "response.incomplete": "incomplete",
 };
 
+/**
+ * Validated inbox row requiring authoritative retrieval: the claim phase
+ * settled everything else. Carries the event-implied status as fallback.
+ */
+interface DeliveryClaim {
+  readonly webhookId: string;
+  readonly responseId: ResponseId;
+  readonly impliedStatus: SubmissionStatus;
+}
 /** Base delay for inbox redelivery after `SQLITE_FULL` (2 seconds). */
 const SQLITE_FULL_BACKOFF_BASE_MS = 2_000 as const;
 
@@ -109,8 +124,6 @@ const SQLITE_FULL_BACKOFF_MAX_MS = 300_000 as const;
 
 /** Maximum length of a persisted, sanitized inbox `last_error` message. */
 const INBOX_ERROR_MAX_CHARS = 500 as const;
-
-const utf8Decoder = new TextDecoder("utf-8", { fatal: false, ignoreBOM: false });
 
 // ============================================================================
 // Pure validation + mapping helpers (no I/O)
@@ -235,78 +248,6 @@ function sanitizeInboxError(error: unknown): string {
 function computeSqliteFullBackoffMs(deliveryAttempts: number): number {
   const shift = Math.min(Math.max(deliveryAttempts - 1, 0), 8);
   return Math.min(SQLITE_FULL_BACKOFF_BASE_MS * 2 ** shift, SQLITE_FULL_BACKOFF_MAX_MS);
-}
-
-function readDetailsNumber(value: unknown, key: string): number {
-  if (typeof value !== "object" || value === null) {
-    return 0;
-  }
-  const field = (value as Record<string, unknown>)[key];
-  return typeof field === "number" && Number.isFinite(field) && field >= 0 ? field : 0;
-}
-
-/** Reads provider-shaped `{input_tokens, output_tokens, total_tokens}` usage, if present. */
-function readProviderUsage(value: unknown): TokenUsage | null {
-  if (typeof value !== "object" || value === null) {
-    return null;
-  }
-  const usage = value as Record<string, unknown>;
-  const inputTokens = usage.input_tokens;
-  const outputTokens = usage.output_tokens;
-  const totalTokens = usage.total_tokens;
-  if (
-    typeof inputTokens !== "number" ||
-    !Number.isFinite(inputTokens) ||
-    inputTokens < 0 ||
-    typeof outputTokens !== "number" ||
-    !Number.isFinite(outputTokens) ||
-    outputTokens < 0 ||
-    typeof totalTokens !== "number" ||
-    !Number.isFinite(totalTokens) ||
-    totalTokens < 0
-  ) {
-    return null;
-  }
-  return {
-    inputTokens,
-    cachedInputTokens: readDetailsNumber(usage.input_tokens_details, "cached_tokens"),
-    outputTokens,
-    reasoningTokens: readDetailsNumber(usage.output_tokens_details, "reasoning_tokens"),
-    totalTokens,
-  };
-}
-
-/**
- * Best-effort usage extraction from a verified webhook payload. Returns the usage
- * object when a provider-shaped usage block is found, else `null` (the caller then
- * keeps the row's prior usage). Never throws.
- */
-function extractWebhookUsage(blob: ArrayBuffer | Uint8Array): TokenUsage | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(utf8Decoder.decode(blob)) as unknown;
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    return null;
-  }
-  const root = parsed as Record<string, unknown>;
-  const data = root.data;
-  const scopes: unknown[] = [root, data, root.response];
-  if (typeof data === "object" && data !== null) {
-    scopes.push((data as Record<string, unknown>).response);
-  }
-  for (const scope of scopes) {
-    if (typeof scope !== "object" || scope === null) {
-      continue;
-    }
-    const direct = readProviderUsage((scope as Record<string, unknown>).usage);
-    if (direct !== null) {
-      return direct;
-    }
-  }
-  return null;
 }
 
 // ============================================================================
@@ -464,7 +405,7 @@ export class LedgerDO extends DurableObject<Env> {
       }
       for (const summary of due) {
         attempted.add(summary.webhook_id);
-        this.deliverInboxRow(summary, observedAtMs, observedIso);
+        await this.deliverInboxRow(summary, observedAtMs, observedIso);
       }
       if (due.length < LIST_PAGE_LIMIT_MAX) {
         break;
@@ -504,96 +445,242 @@ export class LedgerDO extends DurableObject<Env> {
   }
 
   /**
-   * Delivers one due inbox row to its submission inside a single transaction.
-   * Latest observation wins; duplicate ids, settled rows, unmatched rows, and
-   * stale same-state deliveries are no-ops on the submission. Only
-   * `SQLITE_FULL` is retried with backoff; all other failures settle the row.
+   * Delivers one due inbox row in three phases: claim synchronously (validate
+   * + settle no-op/failure cases), fetch the authoritative response envelope
+   * OUTSIDE any transaction (webhook event payloads are status-only and carry
+   * no output or usage), then apply the observation in a second transaction.
+   * Latest observation wins. Retrieval failure keeps the event's status signal
+   * but records the error and leaves the row retryable with backoff.
    */
-  private deliverInboxRow(
+  private async deliverInboxRow(
     summary: WebhookInboxSummaryRow,
     observedAtMs: number,
     observedIso: string,
-  ): void {
+  ): Promise<void> {
     const storage = this.durableStorage();
+    let claim: DeliveryClaim | null = null;
     try {
-      storage.transactionSync(() => {
-        const sql = storage.sql;
-        const inbox =
-          sql
-            .exec<WebhookInboxRow>(
-              `SELECT ${WEBHOOK_INBOX_FULL_COLUMNS} FROM webhook_inbox WHERE webhook_id = ?`,
-              summary.webhook_id,
-            )
-            .toArray()[0] ?? null;
-        if (inbox === null || inbox.status !== "pending") {
-          return;
-        }
-        const failed = (lastError: string): void => {
-          const input: RecordDeliveryResultInput = {
-            webhook_id: inbox.webhook_id,
-            outcome: "failed",
-            last_error: lastError,
-            now_ms: observedAtMs,
-            now_iso: observedIso,
-          };
-          dbRecordDeliveryResult(sql, input);
-        };
-        if (inbox.response_id === null) {
-          failed("missing_response_id");
-          return;
-        }
-        const responseId: ResponseId = inbox.response_id;
-        const submission =
-          sql
-            .exec<SubmissionSummaryRow>(
-              `SELECT ${SUBMISSIONS_SUMMARY_COLUMNS} FROM submissions WHERE response_id = ?`,
-              responseId,
-            )
-            .toArray()[0] ?? null;
-        if (submission === null) {
-          failed("no_matching_submission");
-          return;
-        }
-        const implied =
-          WEBHOOK_EVENT_STATUS[
-            assertWebhookEventType(inbox.event_type, "webhook_inbox.event_type")
-          ];
-        const currentStatus = assertSubmissionStatus(
-          submission.status,
-          "submissions.status",
-        );
-        if (TERMINAL_STATUSES.includes(currentStatus) && currentStatus === implied) {
-          const input: RecordDeliveryResultInput = {
-            webhook_id: inbox.webhook_id,
-            outcome: "duplicate",
-            now_ms: observedAtMs,
-            now_iso: observedIso,
-          };
-          dbRecordDeliveryResult(sql, input);
-          return;
-        }
-        const rawBytes = copyBytes(inbox.raw_body_blob);
-        const observation: RecordObservationCommand = {
-          response_id: responseId,
-          status: implied,
-          response_bytes: rawBytes,
-          response_source: "webhook",
-          observed_at_ms: observedAtMs,
-          usage: extractWebhookUsage(rawBytes),
-          error_json: null,
-          now_ms: observedAtMs,
-        };
-        dbRecordObservation(sql, observation);
-        const delivered: RecordDeliveryResultInput = {
-          webhook_id: inbox.webhook_id,
-          outcome: "delivered",
-          now_ms: observedAtMs,
-          now_iso: observedIso,
-        };
-        dbRecordDeliveryResult(sql, delivered);
-      });
+      claim = withSqlErrorMapping(() =>
+        storage.transactionSync(() => this.claimInboxRow(storage, summary, observedAtMs, observedIso)),
+      );
     } catch (error: unknown) {
       this.settleDeliveryError(summary, observedAtMs, observedIso, error);
+      return;
+    }
+    if (claim === null) {
+      return;
+    }
+    let retrieval: ProviderResponseRetrieval;
+    try {
+      const apiKey = resolveEnvSecret(this.env, "OPENAI_API_KEY");
+      retrieval = await retrieveProviderResponse({ apiKey, responseId: claim.responseId });
+    } catch (error: unknown) {
+      this.settleRetrievalFailure(claim, observedAtMs, observedIso, error);
+      return;
+    }
+    try {
+      withSqlErrorMapping(() =>
+        storage.transactionSync(() =>
+          this.applyRetrievedObservation(storage, claim, retrieval, observedAtMs, observedIso),
+        ),
+      );
+    } catch (error: unknown) {
+      this.settleDeliveryError(summary, observedAtMs, observedIso, error);
+    }
+  }
+
+  /**
+   * Synchronous claim phase: validates the inbox row and settles every case
+   * that needs no retrieval (missing row, non-pending, missing response id,
+   * no matching submission, stale same-state duplicate). Returns the claim
+   * for rows that require authoritative retrieval, or null when settled.
+   * MUST be called inside `transactionSync`; performs no I/O.
+   */
+  private claimInboxRow(
+    storage: SchemaTransactionalStorage,
+    summary: WebhookInboxSummaryRow,
+    observedAtMs: number,
+    observedIso: string,
+  ): DeliveryClaim | null {
+    const sql = storage.sql;
+    const inbox =
+      sql
+        .exec<WebhookInboxRow>(
+          `SELECT ${WEBHOOK_INBOX_FULL_COLUMNS} FROM webhook_inbox WHERE webhook_id = ?`,
+          summary.webhook_id,
+        )
+        .toArray()[0] ?? null;
+    if (inbox === null || inbox.status !== "pending") {
+      return null;
+    }
+    const failed = (lastError: string): null => {
+      const input: RecordDeliveryResultInput = {
+        webhook_id: inbox.webhook_id,
+        outcome: "failed",
+        last_error: lastError,
+        now_ms: observedAtMs,
+        now_iso: observedIso,
+      };
+      dbRecordDeliveryResult(sql, input);
+      return null;
+    };
+    if (inbox.response_id === null) {
+      return failed("missing_response_id");
+    }
+    const responseId: ResponseId = inbox.response_id;
+    const submission =
+      sql
+        .exec<SubmissionSummaryRow>(
+          `SELECT ${SUBMISSIONS_SUMMARY_COLUMNS} FROM submissions WHERE response_id = ?`,
+          responseId,
+        )
+        .toArray()[0] ?? null;
+    if (submission === null) {
+      return failed("no_matching_submission");
+    }
+    const implied =
+      WEBHOOK_EVENT_STATUS[
+        assertWebhookEventType(inbox.event_type, "webhook_inbox.event_type")
+      ];
+    const currentStatus = assertSubmissionStatus(
+      submission.status,
+      "submissions.status",
+    );
+    if (TERMINAL_STATUSES.includes(currentStatus) && currentStatus === implied) {
+      const input: RecordDeliveryResultInput = {
+        webhook_id: inbox.webhook_id,
+        outcome: "duplicate",
+        now_ms: observedAtMs,
+        now_iso: observedIso,
+      };
+      dbRecordDeliveryResult(sql, input);
+      return null;
+    }
+    return { webhookId: inbox.webhook_id, responseId, impliedStatus: implied };
+  }
+
+  /**
+   * Synchronous apply phase: records the authoritatively retrieved envelope
+   * as the observation and marks the inbox row delivered. A `still_running`
+   * retrieval keeps the event's status signal (the event is newer evidence
+   * than the GET) but stores the live bytes. MUST be called inside
+   * `transactionSync`; performs no I/O.
+   */
+  private applyRetrievedObservation(
+    storage: SchemaTransactionalStorage,
+    claim: DeliveryClaim,
+    retrieval: ProviderResponseRetrieval,
+    observedAtMs: number,
+    observedIso: string,
+  ): void {
+    const sql = storage.sql;
+    if (retrieval.kind === "still_running") {
+      const observation: RecordObservationCommand = {
+        response_id: claim.responseId,
+        status: claim.impliedStatus,
+        response_bytes: new TextEncoder().encode(
+          JSON.stringify({ id: retrieval.responseId, status: retrieval.status }),
+        ),
+        response_source: "webhook",
+        observed_at_ms: observedAtMs,
+        usage: null,
+        error_json: JSON.stringify({
+          code: "retrieval_still_running",
+          message: "Authoritative GET returned a non-terminal state after the terminal webhook event; status follows the event",
+        }),
+        now_ms: observedAtMs,
+      };
+      dbRecordObservation(sql, observation);
+    } else {
+      const usage = retrieval.usage;
+      const errorJson =
+        retrieval.errorCode === null && retrieval.errorMessage === null
+          ? null
+          : JSON.stringify({ code: retrieval.errorCode, message: retrieval.errorMessage });
+      const observation: RecordObservationCommand = {
+        response_id: claim.responseId,
+        status: retrieval.status,
+        response_bytes: new Uint8Array(retrieval.rawResponseBytes),
+        response_source: "webhook",
+        observed_at_ms: observedAtMs,
+        usage,
+        error_json: errorJson,
+        now_ms: observedAtMs,
+      };
+      dbRecordObservation(sql, observation);
+    }
+    const delivered: RecordDeliveryResultInput = {
+      webhook_id: claim.webhookId,
+      outcome: "delivered",
+      now_ms: observedAtMs,
+      now_iso: observedIso,
+    };
+    dbRecordDeliveryResult(sql, delivered);
+  }
+
+  /**
+   * Settles an authoritative-retrieval failure. Permanent provider errors
+   * (4xx: the response is gone or unreachable) apply the event's status
+   * signal with the retrieval error recorded and settle the row as delivered
+   * — retrying would never succeed. Transient failures (5xx, network) leave
+   * the submission untouched and the inbox row retryable with backoff, so a
+   * later alarm re-attempts the full envelope.
+   */
+  private settleRetrievalFailure(
+    claim: DeliveryClaim,
+    observedAtMs: number,
+    observedIso: string,
+    error: unknown,
+  ): void {
+    const storage = this.durableStorage();
+    const permanent =
+      error instanceof HttpError && error.status >= 400 && error.status < 500;
+    try {
+      withSqlErrorMapping(() =>
+        storage.transactionSync(() => {
+          if (permanent) {
+            const observation: RecordObservationCommand = {
+              response_id: claim.responseId,
+              status: claim.impliedStatus,
+              response_bytes: new TextEncoder().encode(
+                JSON.stringify({ id: claim.responseId, status: claim.impliedStatus }),
+              ),
+              response_source: "webhook",
+              observed_at_ms: observedAtMs,
+              usage: null,
+              error_json: JSON.stringify({
+                code: "authoritative_retrieval_failed",
+                message: error instanceof Error ? error.message : String(error),
+              }),
+              now_ms: observedAtMs,
+            };
+            dbRecordObservation(storage.sql, observation);
+          }
+          const input: RecordDeliveryResultInput = permanent
+            ? {
+                webhook_id: claim.webhookId,
+                outcome: "delivered",
+                now_ms: observedAtMs,
+                now_iso: observedIso,
+              }
+            : {
+                webhook_id: claim.webhookId,
+                outcome: "retry",
+                next_attempt_at_ms: observedAtMs + SQLITE_FULL_BACKOFF_BASE_MS,
+                last_error: "authoritative_retrieval_failed",
+                now_ms: observedAtMs,
+                now_iso: observedIso,
+              };
+          dbRecordDeliveryResult(storage.sql, input);
+        }),
+      );
+    } catch (nested: unknown) {
+      this.settleDeliveryError(
+        { webhook_id: claim.webhookId } as WebhookInboxSummaryRow,
+        observedAtMs,
+        observedIso,
+        nested,
+      );
     }
   }
 

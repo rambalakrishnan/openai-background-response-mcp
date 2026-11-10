@@ -67,6 +67,61 @@ function observeCmd(overrides: Partial<RecordObservationCommand> = {}): RecordOb
   };
 }
 
+/**
+ * Drives the alarm with `globalThis.fetch` stubbed INSIDE the DO isolate
+ * (DO code runs in a separate isolate from this test worker, so a
+ * test-worker stub would not intercept). `getResponse` answers
+ * `GET /responses/{id}`; everything else passes through.
+ */
+async function driveAlarmWithMockGet(
+  s: Stub,
+  getResponse: (responseId: string) => Response,
+): Promise<void> {
+  await runInDurableObject(s, async (instance: LedgerDO) => {
+    const savedFetch = globalThis.fetch;
+    const stubFetch: typeof fetch = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const match = /\/responses\/([^/?]+)$/.exec(url);
+      if ((init?.method ?? "GET").toUpperCase() === "GET" && match?.[1] !== undefined) {
+        return getResponse(decodeURIComponent(match[1]));
+      }
+      return savedFetch(input, init);
+    };
+    globalThis.fetch = stubFetch;
+    try {
+      await instance.alarm();
+    } finally {
+      globalThis.fetch = savedFetch;
+    }
+  });
+}
+
+function completedGetResponse(responseId: string): Response {
+  return new Response(
+    JSON.stringify({
+      id: responseId,
+      status: "completed",
+      output: [
+        {
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: "mocked-output" }],
+        },
+      ],
+      usage: {
+        input_tokens: 12,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens: 7,
+        output_tokens_details: { reasoning_tokens: 0 },
+        total_tokens: 19,
+      },
+      error: null,
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}
 describe("ledger CRUD + guards (§6)", () => {
   it("records a submission and reads it back with exact bytes", async () => {
     const s = stub();
@@ -219,13 +274,87 @@ describe("webhook inbox (§9)", () => {
     const receipt = await s.enqueueWebhook(webhookCmd());
     expect(receipt.kind).toBe("accepted");
 
-    await runInDurableObject(s, async (instance: LedgerDO) => {
-      await instance.alarm();
-    });
+    await driveAlarmWithMockGet(s, completedGetResponse);
 
     const record = await s.getSubmission("resp_test_1");
     expect(record!.status).toBe("completed");
     expect(record!.response_source).toBe("webhook");
+  });
+
+  it("stores the authoritatively retrieved envelope, not the status-only event", async () => {
+    const s = stub();
+    await s.recordSubmission(submitCmd());
+    // Production-shaped event payload: status signal only, no output or usage.
+    await s.enqueueWebhook(
+      webhookCmd({
+        raw_body: new TextEncoder().encode(
+          JSON.stringify({
+            id: "evt_test_1",
+            object: "event",
+            type: "response.completed",
+            data: { id: "resp_test_1" },
+          }),
+        ),
+      }),
+    );
+
+    await driveAlarmWithMockGet(s, completedGetResponse);
+
+    const blobs = await s.getBlobs("resp_test_1");
+    const stored = new TextDecoder().decode(blobs!.response_bytes!);
+    expect(stored).toContain("mocked-output");
+    expect(stored).not.toContain("evt_test_1");
+    const record = await s.getSubmission("resp_test_1");
+    expect(record!.status).toBe("completed");
+    expect(record!.usage).toMatchObject({ totalTokens: 19 });
+  });
+
+  it("leaves the submission untouched and retries when retrieval transiently fails", async () => {
+    const s = stub();
+    await s.recordSubmission(submitCmd());
+    await s.enqueueWebhook(webhookCmd());
+
+    await driveAlarmWithMockGet(
+      s,
+      () => new Response("provider down", { status: 500 }),
+    );
+
+    const record = await s.getSubmission("resp_test_1");
+    expect(record!.status).toBe("submitted");
+    expect(record!.error_json).toBeNull();
+
+    // Retry succeeds once the provider recovers: rewind the persisted
+    // backoff deadline in-isolate (deterministic; no wall-clock sleep).
+    await runInDurableObject(s, async (_instance: LedgerDO, state) => {
+      state.storage.sql.exec(
+        "UPDATE webhook_inbox SET next_attempt_at_ms = ? WHERE webhook_id = ?",
+        1,
+        "wh_1",
+      );
+    });
+    await driveAlarmWithMockGet(s, completedGetResponse);
+    const recovered = await s.getSubmission("resp_test_1");
+    expect(recovered!.status).toBe("completed");
+    expect(recovered!.usage).toMatchObject({ totalTokens: 19 });
+  });
+
+  it("applies the event status signal when retrieval permanently fails", async () => {
+    const s = stub();
+    await s.recordSubmission(submitCmd());
+    await s.enqueueWebhook(webhookCmd());
+
+    await driveAlarmWithMockGet(
+      s,
+      () =>
+        new Response(JSON.stringify({ error: { code: "not_found", message: "gone" } }), {
+          status: 404,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+
+    const record = await s.getSubmission("resp_test_1");
+    expect(record!.status).toBe("completed");
+    expect(record!.error_json).toContain("authoritative_retrieval_failed");
   });
 
   it("dedupes duplicate webhook ids", async () => {
