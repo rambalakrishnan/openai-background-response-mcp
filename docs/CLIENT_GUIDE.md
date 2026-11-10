@@ -50,6 +50,35 @@ service-token headers are wrong or missing.
 
 Statuses: `submitted → queued → in_progress → completed | failed | cancelled | incomplete`. The first three are in-flight; the last four are terminal.
 
+## Shaping the request (envelope vs message vs extras)
+
+The POST body has three layers; each is controlled differently:
+
+- **Curated params → fixed envelope slots.** `tools`, `tool_choice`,
+  `reasoning`/`reasoning_effort`, `previous_response_id`, `metadata`,
+  `max_output_tokens`, `store`, `service_tier` each map to one top-level
+  body key. Prefer these when they exist.
+- **`extras` → merged verbatim at top level.** Anything without a
+  first-class slot (`include`, `temperature`, `top_p`, `text`,
+  `truncation`, `parallel_tool_calls`, future fields) goes here.
+  Curated params overwrite `extras` on collision — set each key on one
+  side only. `background` is forbidden in `extras` (forced `true`).
+- **`input` → sent verbatim, never reshaped.** Pass a string for a
+  simple prompt, or the full message array for message-level control
+  (content parts, role blocks, reasoning items with echoed
+  `encrypted_content`, `input_text`/`input_image` parts). What you
+  pass is what's sent — verify with `flex_get` + `envelopes: true`.
+
+```json
+// Web search: first-class `tools` (top-level key)
+flex_submit({ "model": "...", "input": "...",
+  "tools": [{"type": "web_search", "search_context_size": "high"}] })
+
+// Encrypted-reasoning include: extras (no first-class slot)
+flex_submit({ "model": "...", "input": "...",
+  "extras": {"include": ["reasoning.encrypted_content"]} })
+```
+
 ## Chaining (multi-turn work)
 
 Pass `previous_response_id` to continue a conversation server-side: the
