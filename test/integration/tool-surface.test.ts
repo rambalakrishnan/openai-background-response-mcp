@@ -434,6 +434,61 @@ describe("per-tool happy paths against the real DO (mocked OpenAI fetch)", () =>
     expect(payload.next_cursor).toBeNull();
   });
 
+  it("flex_submit chains onto an external previous_response_id unknown to the ledger", async () => {
+    // No seeding: resp_external_1 was minted outside this tool and has no row.
+    // The id must pass through to the provider request verbatim (correct term
+    // per the Responses API is `previous_response_id`).
+    let sentBody = "";
+    openAiMock = (url, init) => {
+      expect(url).toBe("https://api.openai.com/v1/responses");
+      const raw = init.body;
+      sentBody =
+        typeof raw === "string"
+          ? raw
+          : raw instanceof ArrayBuffer
+            ? new TextDecoder().decode(raw)
+            : ArrayBuffer.isView(raw)
+              ? new TextDecoder().decode(raw as Uint8Array)
+              : "";
+      return jsonResponse({ id: "resp_chain_1", status: "queued", model: "gpt-5-mini" });
+    };
+
+    const { status, body } = await callTool("flex_submit", {
+      model: "gpt-5-mini",
+      input: "continue from outside",
+      previous_response_id: "resp_external_1",
+    });
+    expect(status).toBe(200);
+    const result = toolResult(body);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.text) as { response_id?: string }).toEqual(
+      expect.objectContaining({ response_id: "resp_chain_1" }),
+    );
+    expect(JSON.parse(sentBody) as { previous_response_id?: string }).toMatchObject({
+      previous_response_id: "resp_external_1",
+    });
+
+    // Ledger records the lineage edge even though the parent has no row.
+    const row = await ledger().getSubmission("resp_chain_1");
+    expect(row?.previous_response_id).toBe("resp_external_1");
+    const children = await callTool("flex_children", { response_id: "resp_external_1" });
+    const childrenResult = toolResult(children.body);
+    expect(childrenResult.isError).toBeUndefined();
+    expect(
+      (JSON.parse(childrenResult.text) as { items?: Array<{ response_id?: string }> }).items?.map(
+        (item) => item.response_id,
+      ),
+    ).toEqual(["resp_chain_1"]);
+  });
+
+  it("flex_children on an unknown id returns an empty page, not an error", async () => {
+    const { status, body } = await callTool("flex_children", { response_id: "resp_nobody" });
+    expect(status).toBe(200);
+    const result = toolResult(body);
+    expect(result.isError).toBeUndefined();
+    expect(JSON.parse(result.text) as unknown).toEqual({ items: [], next_cursor: null });
+  });
+
   it("flex_get extracts output text and raw envelopes", async () => {
     const stub = ledger();
     await stub.recordSubmission(submitCmd({ response_id: "resp_get_1" }));
